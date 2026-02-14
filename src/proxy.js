@@ -1,18 +1,24 @@
 const http = require('http');
 const https = require('https');
+const tls = require('tls');
 const { loadAllConfigs } = require('./config-parser');
 const { buildRewriter } = require('./rewriter');
+const { buildCookieHandler } = require('./cookie-handler');
+const { generateAllCerts } = require('./cert-generator');
 const Router = require('./router');
 
 // ── Settings ──────────────────────────────────────────────
 const CONF_DIR = process.env.CONF_DIR || './conf';
-const LOCAL_PORT = parseInt(process.env.LOCAL_PORT || '3000', 10);
+const HTTP_PORT = parseInt(process.env.HTTP_PORT || '80', 10);
+const HTTPS_PORT = parseInt(process.env.HTTPS_PORT || '443', 10);
 
 const HOP_BY_HOP = new Set([
   'connection', 'keep-alive', 'proxy-authenticate',
   'proxy-authorization', 'te', 'trailers',
   'transfer-encoding', 'upgrade',
 ]);
+
+const FALLBACK_UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36';
 
 // ── Bootstrap ─────────────────────────────────────────────
 const configs = loadAllConfigs(CONF_DIR);
@@ -22,17 +28,52 @@ if (configs.length === 0) {
   process.exit(1);
 }
 
-const router = new Router(configs);
+// Separate configs by protocol
+const httpsConfigs = configs.filter(c => c.targetProtocol === 'https');
+const httpConfigs = configs.filter(c => c.targetProtocol !== 'https');
 
-// Pre-build a rewriter per site
-const rewriters = new Map();
-for (const cfg of configs) {
-  rewriters.set(cfg.localSubdomain, buildRewriter(cfg, LOCAL_PORT));
+// Generate TLS certs for HTTPS sites
+let certMap = new Map();
+if (httpsConfigs.length > 0) {
+  console.log('\n[CERT] Generating certificates for HTTPS sites...');
+  certMap = generateAllCerts(httpsConfigs);
 }
 
-// ── Request handler ───────────────────────────────────────
+const router = new Router(configs);
+
+const rewriters = new Map();
+const cookieHandlers = new Map();
+
+for (const cfg of configs) {
+  const port = cfg.targetProtocol === 'https' ? HTTPS_PORT : HTTP_PORT;
+  rewriters.set(cfg.localSubdomain, buildRewriter(cfg, port));
+  cookieHandlers.set(cfg.localSubdomain, buildCookieHandler(cfg));
+}
+
+// ── Rate limiter ──────────────────────────────────────────
+const requestCounters = new Map();
+
+function checkRateLimit(siteName) {
+  const now = Date.now();
+  const windowMs = 60_000;
+  const maxRequests = 30;
+
+  if (!requestCounters.has(siteName)) {
+    requestCounters.set(siteName, []);
+  }
+
+  const timestamps = requestCounters.get(siteName);
+  while (timestamps.length > 0 && timestamps[0] < now - windowMs) {
+    timestamps.shift();
+  }
+
+  if (timestamps.length >= maxRequests) return false;
+  timestamps.push(now);
+  return true;
+}
+
+// ── Core proxy logic (shared by HTTP and HTTPS servers) ───
 function handleRequest(req, res) {
-  // Handle CORS preflight globally
   if (req.method === 'OPTIONS') {
     res.writeHead(204, {
       'access-control-allow-origin': '*',
@@ -43,25 +84,44 @@ function handleRequest(req, res) {
     return res.end();
   }
 
-  // ── Route lookup ──
   const siteConfig = router.resolve(req);
 
   if (!siteConfig) {
-    // No matching config — show a helpful landing page
     res.writeHead(404, { 'Content-Type': 'text/html; charset=utf-8' });
     return res.end(landingPage());
   }
 
+  if (!checkRateLimit(siteConfig.name)) {
+    console.warn(`[RATE] ${siteConfig.name}: throttled`);
+    res.writeHead(429, { 'Content-Type': 'text/plain' });
+    return res.end('Too many requests. Slow down to avoid upstream blocks.');
+  }
+
   const upstream = router.getUpstream(siteConfig, req.url);
   const rewrite = rewriters.get(siteConfig.localSubdomain);
+  const cookies = cookieHandlers.get(siteConfig.localSubdomain);
+  const localPort = siteConfig.targetProtocol === 'https' ? HTTPS_PORT : HTTP_PORT;
 
-  // ── Build upstream request ──
+  // ── Build upstream headers ──
   const headers = {};
   for (const [k, v] of Object.entries(req.headers)) {
     if (!HOP_BY_HOP.has(k)) headers[k] = v;
   }
+
   headers.host = upstream.host;
-  delete headers['accept-encoding']; // we need raw body for rewriting
+  delete headers['accept-encoding'];
+
+  if (!headers['user-agent']) {
+    headers['user-agent'] = FALLBACK_UA;
+  }
+
+  // ── Cookie handling: outgoing ──
+  const injectCookies = cookies.getInjectCookies();
+  if (injectCookies) {
+    headers['cookie'] = headers['cookie']
+      ? `${headers['cookie']}; ${injectCookies}`
+      : injectCookies;
+  }
 
   const transport = upstream.protocol === 'https' ? https : http;
 
@@ -75,7 +135,7 @@ function handleRequest(req, res) {
 
   console.log(
     `[PROXY] ${siteConfig.name.padEnd(12)} ${req.method.padEnd(7)} ` +
-    `${upstream.host}${upstream.path}`
+    `${upstream.protocol}://${upstream.host}${upstream.path}`
   );
 
   const proxyReq = transport.request(options, (proxyRes) => {
@@ -85,40 +145,46 @@ function handleRequest(req, res) {
       let body = Buffer.concat(chunks);
       const contentType = proxyRes.headers['content-type'] || '';
 
-      // Rewrite body
       body = rewrite(body, contentType);
 
-      // Build response headers
       const resHeaders = {};
       for (const [k, v] of Object.entries(proxyRes.headers)) {
         if (!HOP_BY_HOP.has(k)) resHeaders[k] = v;
       }
 
-      // Remove security headers from config
       for (const h of siteConfig.headersRemove) {
         delete resHeaders[h];
       }
 
-      // Add custom headers from config
+      // ── Cookie handling: incoming ──
+      if (resHeaders['set-cookie']) {
+        const rewritten = cookies.rewriteSetCookies(resHeaders['set-cookie']);
+        if (rewritten.length > 0) {
+          resHeaders['set-cookie'] = rewritten;
+        } else {
+          delete resHeaders['set-cookie'];
+        }
+      }
+
       for (const [k, v] of Object.entries(siteConfig.headersAdd)) {
         resHeaders[k] = v;
       }
 
-      // Fix content-length after rewrite
       resHeaders['content-length'] = body.length;
 
-      // Rewrite Location header on redirects
+      // Rewrite Location on redirects
       if (resHeaders.location) {
-        resHeaders.location = resHeaders.location
-          .replace(
-            new RegExp(`https?://${escapeRegex(siteConfig.targetHost)}`, 'g'),
-            `http://${siteConfig.localSubdomain}:${LOCAL_PORT}`
-          );
-        // Also rewrite rewrite-hosts in Location
+        const localProto = siteConfig.targetProtocol === 'https' ? 'https' : 'http';
+        const localOrigin = `${localProto}://${siteConfig.localSubdomain}:${localPort}`;
+
+        resHeaders.location = resHeaders.location.replace(
+          new RegExp(`https?://${escapeRegex(siteConfig.targetHost)}`, 'g'),
+          localOrigin
+        );
         for (const rw of siteConfig.rewrites) {
           resHeaders.location = resHeaders.location.replace(
             new RegExp(`https?://${escapeRegex(rw.externalHost)}`, 'g'),
-            `http://${siteConfig.localSubdomain}:${LOCAL_PORT}${rw.localPathPrefix}`
+            `${localOrigin}${rw.localPathPrefix}`
           );
         }
       }
@@ -144,29 +210,37 @@ function escapeRegex(str) {
 }
 
 function landingPage() {
-  const rows = router.listRoutes().map(c =>
-    `<tr>
+  const rows = router.listRoutes().map(c => {
+    const proto = c.targetProtocol === 'https' ? 'https' : 'http';
+    const port = c.targetProtocol === 'https' ? HTTPS_PORT : HTTP_PORT;
+    return `<tr>
       <td><strong>${c.name}</strong></td>
-      <td><a href="http://${c.localSubdomain}:${LOCAL_PORT}">
-        ${c.localSubdomain}:${LOCAL_PORT}</a></td>
-      <td>${c.targetHost}</td>
-    </tr>`
-  ).join('\n');
+      <td><a href="${proto}://${c.localSubdomain}:${port}">
+        ${c.localSubdomain}:${port}</a></td>
+      <td>${c.targetProtocol}://${c.targetHost}</td>
+      <td>${proto.toUpperCase()}</td>
+    </tr>`;
+  }).join('\n');
 
   return `<!DOCTYPE html>
 <html><head><title>Local Gateway Proxy</title>
 <style>
-  body { font-family: system-ui, sans-serif; max-width: 800px; margin: 40px auto; padding: 0 20px; }
+  body { font-family: system-ui, sans-serif; max-width: 900px; margin: 40px auto; padding: 0 20px; }
   table { border-collapse: collapse; width: 100%; }
   th, td { border: 1px solid #ddd; padding: 8px 12px; text-align: left; }
   th { background: #f5f5f5; }
   code { background: #f0f0f0; padding: 2px 6px; border-radius: 3px; }
+  .warn { background: #fff3cd; border: 1px solid #ffc107; padding: 12px; border-radius: 4px; margin: 16px 0; }
 </style></head>
 <body>
   <h1>🌐 Local Gateway Proxy</h1>
+  <div class="warn">
+    ⚠️ <strong>Notice:</strong> All traffic through this gateway is monitored.
+    Self-signed certificates are used intentionally.
+  </div>
   <p>No site matched your <code>Host</code> header. Available sites:</p>
   <table>
-    <tr><th>Name</th><th>Local Address</th><th>Upstream</th></tr>
+    <tr><th>Name</th><th>Local Address</th><th>Upstream</th><th>Protocol</th></tr>
     ${rows}
   </table>
   <h3>Setup</h3>
@@ -175,27 +249,84 @@ function landingPage() {
 </body></html>`;
 }
 
-// ── Start ─────────────────────────────────────────────────
-const server = http.createServer(handleRequest);
+// ── Start servers ─────────────────────────────────────────
 
-server.listen(LOCAL_PORT, () => {
-  console.log(`
-╔════════════════════════════════════════════════════════════════╗
-║              Local Gateway Proxy Running                       ║
-╠════════════════════════════════════════════════════════════════╣
-║  Port:     ${String(LOCAL_PORT).padEnd(48)}║
-║  Configs:  ${String(configs.length + ' sites loaded').padEnd(48)}║
-╠════════════════════════════════════════════════════════════════╣`);
+// ── HTTPS server (with SNI for multiple certs) ──
+if (httpsConfigs.length > 0) {
+  // Use the first cert as default, SNI handles the rest
+  const defaultCert = certMap.values().next().value;
 
-  for (const c of configs) {
-    const line = `  ${c.name.padEnd(10)} http://${c.localSubdomain}:${LOCAL_PORT}`;
-    console.log(`║${line.padEnd(60)}║`);
-    console.log(`║${'            => ' + c.targetProtocol + '://' + c.targetHost}${''.padEnd(60 - 15 - c.targetProtocol.length - 3 - c.targetHost.length)}║`);
+  const httpsServer = https.createServer(
+    {
+      key: defaultCert.key,
+      cert: defaultCert.cert,
+      SNICallback: (servername, cb) => {
+        const siteCert = certMap.get(servername);
+        if (siteCert) {
+          cb(null, tls.createSecureContext({
+            key: siteCert.key,
+            cert: siteCert.cert,
+          }));
+        } else {
+          // Fall back to default cert
+          cb(null, tls.createSecureContext({
+            key: defaultCert.key,
+            cert: defaultCert.cert,
+          }));
+        }
+      },
+    },
+    handleRequest
+  );
+
+  httpsServer.listen(HTTPS_PORT, () => {
+    console.log(`[SERVER] HTTPS listening on port ${HTTPS_PORT}`);
+  });
+}
+
+// ── HTTP server (for non-TLS sites + redirect helper) ──
+const httpServer = http.createServer((req, res) => {
+  const siteConfig = router.resolve(req);
+
+  // If this site should be HTTPS, redirect
+  if (siteConfig && siteConfig.targetProtocol === 'https') {
+    const location = `https://${siteConfig.localSubdomain}:${HTTPS_PORT}${req.url}`;
+    res.writeHead(301, { Location: location });
+    return res.end();
   }
 
-  console.log(`╚════════════════════════════════════════════════════════════════╝
-
-Add to /etc/hosts:
-${router.listRoutes().map(c => `  127.0.0.1  ${c.localSubdomain}`).join('\n')}
-  `);
+  // Otherwise handle normally (HTTP-only sites)
+  handleRequest(req, res);
 });
+
+httpServer.listen(HTTP_PORT, () => {
+  console.log(`[SERVER] HTTP  listening on port ${HTTP_PORT}`);
+});
+
+// ── Startup banner ────────────────────────────────────────
+console.log(`
+╔══════════════════════════════════════════════════════════════════════╗
+║                   Local Gateway Proxy Running                        ║
+╠═════════════════════════════════════════════════���════════════════════╣
+║  HTTP:   port ${String(HTTP_PORT).padEnd(53)}║
+║  HTTPS:  port ${String(HTTPS_PORT).padEnd(53)}║
+║  Sites:  ${String(configs.length + ' loaded').padEnd(58)}║
+╠══════════════════════════════════════════════════════════════════════╣`);
+
+for (const c of configs) {
+  const proto = c.targetProtocol === 'https' ? 'https' : 'http';
+  const port = c.targetProtocol === 'https' ? HTTPS_PORT : HTTP_PORT;
+  const local = `${proto}://${c.localSubdomain}:${port}`;
+  const upstream = `${c.targetProtocol}://${c.targetHost}`;
+  console.log(`║  ${c.name.padEnd(10)} ${local.padEnd(50)} ║`);
+  console.log(`║  ${''.padEnd(10)} => ${upstream.padEnd(47)}║`);
+}
+
+console.log(`╠══════════════════════════════════════════════════════════════════════╣
+║  ⚠️  Self-signed certs = browser warnings = monitoring notice       ║
+║  📁 CA cert: ./certs/ca.crt (install to trust, or don't)            ║
+╚══════════════════════════════════════════════════════════════════════╝
+
+/etc/hosts:
+${router.listRoutes().map(c => `  127.0.0.1  ${c.localSubdomain}`).join('\n')}
+`);

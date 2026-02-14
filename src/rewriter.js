@@ -2,6 +2,9 @@
  * Rewrites URLs in response bodies so that the client
  * stays on the local proxy instead of being redirected
  * to the real upstream host.
+ *
+ * Now protocol-aware: if the site is served over HTTPS locally,
+ * rewrites use https:// instead of http://.
  */
 
 const TEXT_CONTENT_TYPES = [
@@ -29,7 +32,10 @@ function isTextContent(contentType) {
  * @returns {function(Buffer, string): Buffer}
  */
 function buildRewriter(siteConfig, localPort) {
-  const localOrigin = `http://${siteConfig.localSubdomain}:${localPort}`;
+  // Use the same protocol as the target site for our local mirror
+  const localProtocol = siteConfig.targetProtocol === 'https' ? 'https' : 'http';
+  const localOrigin = `${localProtocol}://${siteConfig.localSubdomain}:${localPort}`;
+  const localHostPort = `${siteConfig.localSubdomain}:${localPort}`;
 
   // Pre-compute all replacement pairs
   const replacements = [];
@@ -38,7 +44,7 @@ function buildRewriter(siteConfig, localPort) {
   replacements.push(
     { from: `https://${siteConfig.targetHost}`, to: localOrigin },
     { from: `http://${siteConfig.targetHost}`, to: localOrigin },
-    { from: `//${siteConfig.targetHost}`, to: `//${siteConfig.localSubdomain}:${localPort}` },
+    { from: `//${siteConfig.targetHost}`, to: `//${localHostPort}` },
   );
 
   // Rewrite hosts (subdomains like api.github.com -> /api)
@@ -47,7 +53,7 @@ function buildRewriter(siteConfig, localPort) {
     replacements.push(
       { from: `https://${rw.externalHost}`, to: localRewriteOrigin },
       { from: `http://${rw.externalHost}`, to: localRewriteOrigin },
-      { from: `//${rw.externalHost}`, to: `//${siteConfig.localSubdomain}:${localPort}${rw.localPathPrefix}` },
+      { from: `//${rw.externalHost}`, to: `//${localHostPort}${rw.localPathPrefix}` },
     );
   }
 

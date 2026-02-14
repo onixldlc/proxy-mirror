@@ -1,33 +1,6 @@
 const fs = require('fs');
 const path = require('path');
 
-/**
- * Parses a .conf file with the following format:
- *
- *   # Comment lines start with #
- *   [proxy]
- *   name = example
- *   local_subdomain = example.localgateway.com
- *   target_host = example.com
- *   target_protocol = https
- *
- *   [rewrites]
- *   api.example.com = /api
- *   raw.example.com = /raw
- *   assets.example.com = /assets
- *   avatars.example.com = /avatars
- *
- *   [headers.remove]
- *   content-security-policy
- *   strict-transport-security
- *   x-frame-options
- *
- *   [headers.add]
- *   access-control-allow-origin = *
- *   access-control-allow-methods = GET, POST, PUT, DELETE, OPTIONS
- *   access-control-allow-headers = *
- */
-
 function parseConfFile(filePath) {
   const content = fs.readFileSync(filePath, 'utf8');
   const lines = content.split('\n');
@@ -38,10 +11,11 @@ function parseConfFile(filePath) {
     targetHost: '',
     targetProtocol: 'https',
     targetPort: 443,
-    rewrites: [],          // { externalHost, localPathPrefix }
+    rewrites: [],
     headersRemove: [],
     headersAdd: {},
-    rewriteContent: true,  // whether to do URL rewriting in response bodies
+    rewriteContent: true,
+    injectCookie: '',      // static cookies to inject on every upstream request
   };
 
   let currentSection = null;
@@ -49,17 +23,14 @@ function parseConfFile(filePath) {
   for (let rawLine of lines) {
     const line = rawLine.trim();
 
-    // Skip empty lines and comments
     if (!line || line.startsWith('#')) continue;
 
-    // Section header
     const sectionMatch = line.match(/^\[(.+)\]$/);
     if (sectionMatch) {
       currentSection = sectionMatch[1].toLowerCase().trim();
       continue;
     }
 
-    // Key-value or standalone value depending on section
     if (currentSection === 'proxy') {
       const [key, ...rest] = line.split('=');
       const k = key.trim().toLowerCase();
@@ -84,9 +55,11 @@ function parseConfFile(filePath) {
         case 'rewrite_content':
           config.rewriteContent = v.toLowerCase() === 'true' || v === '1';
           break;
+        case 'inject_cookie':
+          config.injectCookie = v;
+          break;
       }
     } else if (currentSection === 'rewrites') {
-      // format: external.host.com = /local-prefix
       const [key, ...rest] = line.split('=');
       if (rest.length > 0) {
         config.rewrites.push({
@@ -95,7 +68,6 @@ function parseConfFile(filePath) {
         });
       }
     } else if (currentSection === 'headers.remove') {
-      // Each line is just a header name
       config.headersRemove.push(line.toLowerCase());
     } else if (currentSection === 'headers.add') {
       const [key, ...rest] = line.split('=');
