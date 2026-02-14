@@ -28,11 +28,9 @@ if (configs.length === 0) {
   process.exit(1);
 }
 
-// Separate configs by protocol
 const httpsConfigs = configs.filter(c => c.targetProtocol === 'https');
 const httpConfigs = configs.filter(c => c.targetProtocol !== 'https');
 
-// Generate TLS certs for HTTPS sites
 let certMap = new Map();
 if (httpsConfigs.length > 0) {
   console.log('\n[CERT] Generating certificates for HTTPS sites...');
@@ -50,29 +48,7 @@ for (const cfg of configs) {
   cookieHandlers.set(cfg.localSubdomain, buildCookieHandler(cfg));
 }
 
-// ── Rate limiter ──────────────────────────────────────────
-const requestCounters = new Map();
-
-function checkRateLimit(siteName) {
-  const now = Date.now();
-  const windowMs = 60_000;
-  const maxRequests = 30;
-
-  if (!requestCounters.has(siteName)) {
-    requestCounters.set(siteName, []);
-  }
-
-  const timestamps = requestCounters.get(siteName);
-  while (timestamps.length > 0 && timestamps[0] < now - windowMs) {
-    timestamps.shift();
-  }
-
-  if (timestamps.length >= maxRequests) return false;
-  timestamps.push(now);
-  return true;
-}
-
-// ── Core proxy logic (shared by HTTP and HTTPS servers) ───
+// ── Core proxy logic ──────────────────────────────────────
 function handleRequest(req, res) {
   if (req.method === 'OPTIONS') {
     res.writeHead(204, {
@@ -89,12 +65,6 @@ function handleRequest(req, res) {
   if (!siteConfig) {
     res.writeHead(404, { 'Content-Type': 'text/html; charset=utf-8' });
     return res.end(landingPage());
-  }
-
-  if (!checkRateLimit(siteConfig.name)) {
-    console.warn(`[RATE] ${siteConfig.name}: throttled`);
-    res.writeHead(429, { 'Content-Type': 'text/plain' });
-    return res.end('Too many requests. Slow down to avoid upstream blocks.');
   }
 
   const upstream = router.getUpstream(siteConfig, req.url);
@@ -249,11 +219,9 @@ function landingPage() {
 </body></html>`;
 }
 
-// ── Start servers ─────────────────────────────────────────
+// ── Start servers ─────────────────────────────��───────────
 
-// ── HTTPS server (with SNI for multiple certs) ──
 if (httpsConfigs.length > 0) {
-  // Use the first cert as default, SNI handles the rest
   const defaultCert = certMap.values().next().value;
 
   const httpsServer = https.createServer(
@@ -268,7 +236,6 @@ if (httpsConfigs.length > 0) {
             cert: siteCert.cert,
           }));
         } else {
-          // Fall back to default cert
           cb(null, tls.createSecureContext({
             key: defaultCert.key,
             cert: defaultCert.cert,
@@ -284,18 +251,15 @@ if (httpsConfigs.length > 0) {
   });
 }
 
-// ── HTTP server (for non-TLS sites + redirect helper) ──
 const httpServer = http.createServer((req, res) => {
   const siteConfig = router.resolve(req);
 
-  // If this site should be HTTPS, redirect
   if (siteConfig && siteConfig.targetProtocol === 'https') {
     const location = `https://${siteConfig.localSubdomain}:${HTTPS_PORT}${req.url}`;
     res.writeHead(301, { Location: location });
     return res.end();
   }
 
-  // Otherwise handle normally (HTTP-only sites)
   handleRequest(req, res);
 });
 
@@ -303,11 +267,11 @@ httpServer.listen(HTTP_PORT, () => {
   console.log(`[SERVER] HTTP  listening on port ${HTTP_PORT}`);
 });
 
-// ── Startup banner ────────────────────────────────────────
+// ── Startup banner ─────────────────��──────────────────────
 console.log(`
 ╔══════════════════════════════════════════════════════════════════════╗
 ║                   Local Gateway Proxy Running                        ║
-╠═════════════════════════════════════════════════���════════════════════╣
+╠══════════════════════════════════════════════════════════════════════╣
 ║  HTTP:   port ${String(HTTP_PORT).padEnd(53)}║
 ║  HTTPS:  port ${String(HTTPS_PORT).padEnd(53)}║
 ║  Sites:  ${String(configs.length + ' loaded').padEnd(58)}║
