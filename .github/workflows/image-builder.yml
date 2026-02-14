@@ -1,0 +1,129 @@
+name: Build and Push Docker Image
+
+on:
+  push:
+    branches: [main, master]
+    paths:
+      - 'src/**'
+      - 'conf/**'
+      - 'Dockerfile'
+      - '.github/workflows/image-builder.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+
+env:
+  REGISTRY: ghcr.io
+  BASE_VERSION: "1.0.0"
+  # ── Image list ──────────────────────────────────────────────
+  # Each entry: "<image-name>|<context-dir>|<dockerfile-path>"
+  # Add more entries to build multiple images from the same repo.
+  IMAGES: |
+    proxy-mirror|.|./Dockerfile
+
+jobs:
+  get-version:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      image_matrix: ${{ steps.matrix.outputs.image_matrix }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Get version
+        id: version
+        run: |
+          # Use the first image name for version tagging
+          IMAGE_NAME=$(echo "$IMAGES" | head -n1 | cut -d'|' -f1 | xargs)
+          FULL_IMAGE="${REGISTRY}/${{ github.repository_owner }}/${IMAGE_NAME}"
+
+          TAGS=$(skopeo list-tags docker://${FULL_IMAGE} 2>/dev/null | jq -r '.Tags[]?' || echo "")
+
+          echo "Found tags: [$TAGS]"
+
+          # Find highest revision number for current base version
+          HIGHEST_REV=0
+          for tag in $TAGS; do
+            echo "Checking tag: $tag"
+            if [[ $tag =~ ^${BASE_VERSION}-r([0-9]+)$ ]]; then
+              REV=${BASH_REMATCH[1]}
+              echo "  -> Matched! Revision: $REV"
+              if [[ $REV -gt $HIGHEST_REV ]]; then
+                HIGHEST_REV=$REV
+              fi
+            fi
+          done
+
+          # Increment revision
+          NEXT_REV=$((HIGHEST_REV + 1))
+          NEW_VERSION="${BASE_VERSION}-r${NEXT_REV}"
+
+          echo "========================================"
+          echo "RESULT: version=${NEW_VERSION}"
+          echo "Previous highest revision: r${HIGHEST_REV}"
+          echo "========================================"
+
+          echo "version=${NEW_VERSION}" >> $GITHUB_OUTPUT
+
+      - name: Build image matrix
+        id: matrix
+        run: |
+          MATRIX=$(echo "$IMAGES" | sed '/^\s*$/d' | jq -R -s -c 'split("\n") | map(select(length > 0) | ltrimstr(" "))')
+          echo "image_matrix=${MATRIX}" >> $GITHUB_OUTPUT
+          echo "Matrix: ${MATRIX}"
+
+  build:
+    runs-on: ubuntu-latest
+    needs: get-version
+    strategy:
+      matrix:
+        image: ${{ fromJson(needs.get-version.outputs.image_matrix || '[]') }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Parse image config
+        id: cfg
+        run: |
+          echo "name=$(echo '${{ matrix.image }}' | cut -d'|' -f1 | xargs)" >> $GITHUB_OUTPUT
+          echo "context=$(echo '${{ matrix.image }}' | cut -d'|' -f2 | xargs)" >> $GITHUB_OUTPUT
+          echo "dockerfile=$(echo '${{ matrix.image }}' | cut -d'|' -f3 | xargs)" >> $GITHUB_OUTPUT
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ github.repository_owner }}/${{ steps.cfg.outputs.name }}
+          tags: |
+            type=raw,value=${{ needs.get-version.outputs.version }}
+            type=raw,value=latest
+
+      - name: Build and push
+        uses: docker/build-push-action@v5
+        with:
+          context: ${{ steps.cfg.outputs.context }}
+          file: ${{ steps.cfg.outputs.dockerfile }}
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Summary
+        run: |
+          echo "**Image:** \`${{ env.REGISTRY }}/${{ github.repository_owner }}/${{ steps.cfg.outputs.name }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "**Version:** \`${{ needs.get-version.outputs.version }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "**Tags:** \`${{ needs.get-version.outputs.version }}\`, \`latest\`" >> $GITHUB_STEP_SUMMARY
