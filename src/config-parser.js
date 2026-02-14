@@ -11,11 +11,12 @@ function parseConfFile(filePath) {
     targetHost: '',
     targetProtocol: 'https',
     targetPort: 443,
-    rewrites: [],
+    rewrites: [],           // { externalHost, localPathPrefix, isWildcard }
+    wildcardRewrites: [],   // { pattern (regex), rootDomain, localPathPrefix }
     headersRemove: [],
     headersAdd: {},
     rewriteContent: true,
-    injectCookie: '',      // static cookies to inject on every upstream request
+    injectCookie: '',
   };
 
   let currentSection = null;
@@ -62,10 +63,25 @@ function parseConfFile(filePath) {
     } else if (currentSection === 'rewrites') {
       const [key, ...rest] = line.split('=');
       if (rest.length > 0) {
-        config.rewrites.push({
-          externalHost: key.trim(),
-          localPathPrefix: rest.join('=').trim(),
-        });
+        const externalHost = key.trim();
+        const localPathPrefix = rest.join('=').trim();
+
+        if (externalHost.startsWith('*.')) {
+          // Wildcard rewrite: *.google.com = /g
+          // Matches: anything.google.com, sub.anything.google.com, etc.
+          const rootDomain = externalHost.slice(2); // remove "*."
+          const escapedRoot = rootDomain.replace(/\./g, '\\.');
+          config.wildcardRewrites.push({
+            pattern: new RegExp(`^(.+)\\.${escapedRoot}$`),
+            rootDomain,
+            localPathPrefix,
+          });
+        } else {
+          config.rewrites.push({
+            externalHost,
+            localPathPrefix,
+          });
+        }
       }
     } else if (currentSection === 'headers.remove') {
       config.headersRemove.push(line.toLowerCase());
@@ -100,6 +116,9 @@ function loadAllConfigs(confDir) {
       const config = parseConfFile(path.join(confDir, file));
       configs.push(config);
       console.log(`[CONFIG] Loaded: ${file} -> ${config.localSubdomain} => ${config.targetHost}`);
+      if (config.wildcardRewrites.length > 0) {
+        console.log(`[CONFIG]   Wildcards: ${config.wildcardRewrites.map(w => '*.' + w.rootDomain).join(', ')}`);
+      }
     } catch (err) {
       console.error(`[CONFIG] Failed to parse ${file}: ${err.message}`);
     }

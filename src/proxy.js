@@ -29,7 +29,6 @@ if (configs.length === 0) {
 }
 
 const httpsConfigs = configs.filter(c => c.targetProtocol === 'https');
-const httpConfigs = configs.filter(c => c.targetProtocol !== 'https');
 
 let certMap = new Map();
 if (httpsConfigs.length > 0) {
@@ -117,25 +116,46 @@ function handleRequest(req, res) {
 
       body = rewrite(body, contentType);
 
+      // ── Build response headers ──
+      // Use raw headers to preserve ALL Set-Cookie headers.
+      // Node's proxyRes.headers merges duplicate header names,
+      // but rawHeaders keeps every single one.
       const resHeaders = {};
-      for (const [k, v] of Object.entries(proxyRes.headers)) {
-        if (!HOP_BY_HOP.has(k)) resHeaders[k] = v;
+      const rawSetCookies = [];
+
+      // Collect headers from raw pairs to avoid merging
+      const rawH = proxyRes.rawHeaders;
+      for (let i = 0; i < rawH.length; i += 2) {
+        const key = rawH[i];
+        const val = rawH[i + 1];
+        const keyLower = key.toLowerCase();
+
+        if (HOP_BY_HOP.has(keyLower)) continue;
+
+        if (keyLower === 'set-cookie') {
+          // Collect ALL Set-Cookie headers individually
+          rawSetCookies.push(val);
+        } else {
+          // For other headers, last value wins (same as Node default)
+          resHeaders[keyLower] = val;
+        }
       }
 
+      // Remove headers per config
       for (const h of siteConfig.headersRemove) {
         delete resHeaders[h];
       }
 
       // ── Cookie handling: incoming ──
-      if (resHeaders['set-cookie']) {
-        const rewritten = cookies.rewriteSetCookies(resHeaders['set-cookie']);
+      // Now we have EVERY Set-Cookie from upstream, none lost
+      if (rawSetCookies.length > 0) {
+        const rewritten = cookies.rewriteSetCookies(rawSetCookies);
         if (rewritten.length > 0) {
           resHeaders['set-cookie'] = rewritten;
-        } else {
-          delete resHeaders['set-cookie'];
         }
       }
 
+      // Add headers per config
       for (const [k, v] of Object.entries(siteConfig.headersAdd)) {
         resHeaders[k] = v;
       }
@@ -219,7 +239,7 @@ function landingPage() {
 </body></html>`;
 }
 
-// ── Start servers ─────────────────────────────��───────────
+// ── Start servers ─────────────────────────────────────────
 
 if (httpsConfigs.length > 0) {
   const defaultCert = certMap.values().next().value;
@@ -267,7 +287,7 @@ httpServer.listen(HTTP_PORT, () => {
   console.log(`[SERVER] HTTP  listening on port ${HTTP_PORT}`);
 });
 
-// ── Startup banner ─────────────────��──────────────────────
+// ── Startup banner ────────────────────────────────────────
 console.log(`
 ╔══════════════════════════════════════════════════════════════════════╗
 ║                   Local Gateway Proxy Running                        ║

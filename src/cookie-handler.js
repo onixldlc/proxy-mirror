@@ -1,25 +1,8 @@
 /**
  * Handles bidirectional cookie domain rewriting.
- *
- * Since we now serve HTTPS with self-signed certs:
- *   - Secure flag is KEPT (we're on HTTPS!)
- *   - SameSite=None is KEPT (works with Secure)
- *   - __Secure- and __Host- prefixes are KEPT (work with Secure)
- *   - Only the domain= attribute is rewritten
- *
- * Downstream (upstream → client):
- *   Set-Cookie: NID=abc; domain=.google.com; path=/; Secure; HttpOnly; SameSite=None
- *   becomes:
- *   Set-Cookie: NID=abc; domain=google.localgateway.com; path=/; Secure; HttpOnly; SameSite=None
- *
- * That's it. Just the domain. Everything else passes through.
+ * Only rewrites the domain= attribute. Everything else untouched.
  */
 
-/**
- * Parse a Set-Cookie header string into its parts.
- * @param {string} raw - Raw Set-Cookie header value
- * @returns {{ nameValue: string, attributes: Map<string, string|true> }}
- */
 function parseCookie(raw) {
   const parts = raw.split(';').map(p => p.trim());
   const nameValue = parts[0];
@@ -39,9 +22,6 @@ function parseCookie(raw) {
   return { nameValue, attributes };
 }
 
-/**
- * Serialize parsed cookie back to Set-Cookie string.
- */
 function serializeCookie({ nameValue, attributes }) {
   let result = nameValue;
 
@@ -56,18 +36,14 @@ function serializeCookie({ nameValue, attributes }) {
   return result;
 }
 
-/**
- * Build a cookie rewriter for a given site config.
- *
- * @param {object} siteConfig - Parsed site config
- * @returns {{ rewriteSetCookies: function, getInjectCookies: function }}
- */
 function buildCookieHandler(siteConfig) {
+  // Collect ALL upstream domains — explicit + wildcard roots
   const upstreamDomains = [
     siteConfig.targetHost,
     ...siteConfig.rewrites.map(r => r.externalHost),
   ];
 
+  // Root domains from explicit hosts
   const rootDomains = [...new Set(
     upstreamDomains.map(d => {
       const parts = d.split('.');
@@ -77,13 +53,17 @@ function buildCookieHandler(siteConfig) {
     })
   )];
 
-  /**
-   * Rewrite Set-Cookie headers from upstream response.
-   * ONLY rewrites the domain= attribute. Everything else untouched.
-   *
-   * @param {string|string[]} setCookieHeaders
-   * @returns {string[]}
-   */
+  // Add wildcard root domains
+  for (const wc of siteConfig.wildcardRewrites) {
+    const parts = wc.rootDomain.split('.');
+    const root = parts.length >= 2
+      ? parts.slice(-2).join('.')
+      : wc.rootDomain;
+    if (!rootDomains.includes(root)) {
+      rootDomains.push(root);
+    }
+  }
+
   function rewriteSetCookies(setCookieHeaders) {
     if (!setCookieHeaders) return [];
 
@@ -94,7 +74,6 @@ function buildCookieHandler(siteConfig) {
     return cookies.map(raw => {
       const parsed = parseCookie(raw);
 
-      // ── Rewrite domain — the ONLY thing we change ──
       if (parsed.attributes.has('domain')) {
         const originalDomain = parsed.attributes.get('domain')
           .replace(/^\./, '');
@@ -114,10 +93,6 @@ function buildCookieHandler(siteConfig) {
     });
   }
 
-  /**
-   * Get any static cookies to inject from config.
-   * @returns {string}
-   */
   function getInjectCookies() {
     return siteConfig.injectCookie || '';
   }
