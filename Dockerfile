@@ -3,7 +3,6 @@ FROM node:20-alpine
 WORKDIR /app
 
 COPY src/ ./src/
-COPY conf/ ./conf/
 
 ENV CONF_DIR=/app/conf
 ENV LOCAL_PORT=3000
