@@ -1,0 +1,12 @@
+services:
+  gateway-proxy:
+    build: .
+    container_name: gateway-proxy
+    ports:
+      - "3000:3000"
+    volumes:
+      - ./conf:/app/conf:ro
+    environment:
+      - LOCAL_PORT=3000    # optional
+      - CONF_DIR=/app/conf  # optional
+    restart: unless-stopped
